@@ -28,6 +28,12 @@
   label.toggle input { width:28px; height:28px; accent-color:var(--on); }
   #status { text-align:center; color:var(--sub); min-height:1.5em; }
   #status.warn { color:var(--warn); }
+  .btn { width:100%; min-height:52px; border:none; border-radius:12px; font-size:18px; font-weight:600;
+         color:#fff; background:#475569; margin-top:6px; }
+  .seg { display:flex; gap:8px; margin-top:8px; }
+  .seg button { flex:1; min-height:48px; border-radius:12px; border:2px solid #475569; background:transparent; color:var(--fg); font-size:16px; }
+  .seg button.sel { background:var(--off); border-color:var(--off); }
+  .hint { color:var(--sub); font-size:15px; line-height:1.6; margin:8px 0 0; }
   details { color:var(--sub); font-size:15px; line-height:1.7; }
   summary { font-size:17px; color:var(--fg); }
 </style>
@@ -49,6 +55,27 @@
     <label class="toggle">ハウリング対策（低音カット＋リミッター）<input id="filter" type="checkbox" checked></label>
     <label class="toggle">ノイズ抑制<input id="noise" type="checkbox" checked></label>
   </section>
+
+  <section class="card">
+    <div class="row" style="margin-bottom:0"><span>出力方式</span></div>
+    <div class="seg">
+      <button type="button" data-mode="element">A（おすすめ）</button>
+      <button type="button" data-mode="context">B</button>
+    </div>
+    <p class="hint">スピーカーから音が出ないときは、もう一方の方式に切り替えてください。</p>
+    <button id="route" class="btn" type="button">🔈 出力先のスピーカーを選ぶ</button>
+    <p class="hint" id="routeHint">押せない／表示されないときは、画面右上から下へスワイプしてコントロールセンターを開き、音楽の枠の右上にある <b>AirPlayマーク（◎に△）</b> からスピーカーを選んでください。</p>
+  </section>
+
+  <details class="card">
+    <summary>スピーカーから音が出ないとき</summary>
+    <ol>
+      <li>「スタート」を押した<b>あと</b>に「出力先のスピーカーを選ぶ」（またはコントロールセンターのAirPlayマーク）でスピーカーを選び直す。</li>
+      <li>出力方式を A ⇔ B で切り替える。</li>
+      <li>一度ストップし、iPadの設定 → Bluetooth でスピーカーを切断→再接続してからスタートする。</li>
+      <li>それでもだめなときは、ケーブル（USB-C/Lightning→3.5mm変換）でスピーカーのAUX端子につなぐと確実で、遅れもほぼありません。</li>
+    </ol>
+  </details>
 
   <details class="card">
     <summary>使い方とコツ</summary>
@@ -72,8 +99,17 @@
   const power = $('power'), gainEl = $('gain'), gainVal = $('gainVal'),
         meterEl = $('meter'), statusEl = $('status'), filterEl = $('filter'), noiseEl = $('noise');
 
-  let ctx, stream, src, hp, comp, gainNode, analyser, raf, wakeLock;
+  let ctx, stream, src, hp, comp, gainNode, analyser, raf, wakeLock, streamOut;
   let running = false;
+  let mode = 'element';
+
+  // 出力用の audio 要素。iOSではこちらの方がシステムの出力先（Bluetooth）に従いやすく、
+  // AirPlay／出力先ピッカーも開ける
+  const outEl = document.createElement('audio');
+  outEl.setAttribute('playsinline', '');
+  outEl.setAttribute('x-webkit-airplay', 'allow');
+  outEl.autoplay = true;
+  document.body.appendChild(outEl);
 
   // 保存された設定を復元
   try {
@@ -81,9 +117,10 @@
     if (s.gain != null) gainEl.value = s.gain;
     if (s.filter != null) filterEl.checked = s.filter;
     if (s.noise != null) noiseEl.checked = s.noise;
+    if (s.mode) mode = s.mode;
   } catch {}
   const save = () => {
-    try { localStorage.setItem('voiceamp', JSON.stringify({ gain: gainEl.value, filter: filterEl.checked, noise: noiseEl.checked })); } catch {}
+    try { localStorage.setItem('voiceamp', JSON.stringify({ gain: gainEl.value, filter: filterEl.checked, noise: noiseEl.checked, mode })); } catch {}
   };
 
   const showGain = () => { gainVal.textContent = '×' + Number(gainEl.value).toFixed(1); };
@@ -100,6 +137,8 @@
   }
 
   async function start() {
+    // Safari 16.4+: 録音しながら再生するセッションであることを明示
+    try { if (navigator.audioSession) navigator.audioSession.type = 'play-and-record'; } catch {}
     try {
       stream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: false, autoGainControl: false, noiseSuppression: noiseEl.checked, channelCount: 1 }
@@ -119,7 +158,14 @@
     analyser = ctx.createAnalyser(); analyser.fftSize = 512;
 
     connectGraph();
-    gainNode.connect(ctx.destination);
+    if (mode === 'element') {
+      streamOut = ctx.createMediaStreamDestination();
+      gainNode.connect(streamOut);
+      outEl.srcObject = streamOut.stream;
+      try { await outEl.play(); } catch { setStatus('再生を開始できませんでした。出力方式Bを試してください。', true); }
+    } else {
+      gainNode.connect(ctx.destination);
+    }
 
     try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
 
@@ -135,7 +181,8 @@
     stream?.getTracks().forEach(t => t.stop());
     try { await ctx?.close(); } catch {}
     try { await wakeLock?.release(); } catch {}
-    ctx = stream = wakeLock = null;
+    outEl.pause(); outEl.srcObject = null;
+    ctx = stream = wakeLock = streamOut = null;
     meterEl.style.width = '0';
     power.textContent = 'スタート'; power.classList.remove('on');
     setStatus('停止しました');
@@ -154,6 +201,23 @@
   }
 
   power.addEventListener('click', () => (running ? stop() : start()));
+
+  const segBtns = document.querySelectorAll('.seg button');
+  const showMode = () => segBtns.forEach(b => b.classList.toggle('sel', b.dataset.mode === mode));
+  showMode();
+  segBtns.forEach(b => b.addEventListener('click', async () => {
+    if (b.dataset.mode === mode) return;
+    mode = b.dataset.mode; showMode(); save();
+    if (running) { await stop(); await start(); }
+  }));
+
+  $('route').addEventListener('click', () => {
+    if (typeof outEl.webkitShowPlaybackTargetPicker === 'function') {
+      try { outEl.webkitShowPlaybackTargetPicker(); return; } catch {}
+    }
+    $('routeHint').scrollIntoView({ behavior: 'smooth', block: 'center' });
+    setStatus('コントロールセンターのAirPlayマークから出力先を選んでください', true);
+  });
 
   gainEl.addEventListener('input', () => {
     showGain(); save();
