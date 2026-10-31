@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="こえアンプ">
+<meta name="theme-color" content="#0f172a">
+<link rel="manifest" href="manifest.json">
+<title>こえアンプ</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --fg:#f1f5f9; --sub:#94a3b8; --on:#22c55e; --off:#3b82f6; --warn:#f59e0b; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body { margin:0; background:var(--bg); color:var(--fg); font-family:-apple-system, "Hiragino Sans", sans-serif;
+         min-height:100vh; display:flex; justify-content:center; padding:24px 16px; user-select:none; }
+  main { width:100%; max-width:560px; display:flex; flex-direction:column; gap:20px; }
+  h1 { margin:0; font-size:28px; text-align:center; }
+  #power { width:220px; height:220px; border-radius:50%; border:none; margin:8px auto; font-size:32px; font-weight:700;
+           color:#fff; background:var(--off); box-shadow:0 10px 30px rgba(0,0,0,.4); }
+  #power.on { background:var(--on); }
+  .card { background:var(--card); border-radius:16px; padding:18px 20px; }
+  .row { display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; font-size:18px; }
+  .val { font-variant-numeric:tabular-nums; color:var(--sub); }
+  input[type=range] { width:100%; height:44px; accent-color:var(--on); }
+  .meter { height:18px; background:#0b1220; border-radius:9px; overflow:hidden; }
+  .meter > div { height:100%; width:0; background:linear-gradient(90deg,#22c55e 0%,#eab308 70%,#ef4444 100%); transition:width 60ms linear; }
+  label.toggle { display:flex; justify-content:space-between; align-items:center; font-size:18px; padding:6px 0; }
+  label.toggle input { width:28px; height:28px; accent-color:var(--on); }
+  #status { text-align:center; color:var(--sub); min-height:1.5em; }
+  #status.warn { color:var(--warn); }
+  details { color:var(--sub); font-size:15px; line-height:1.7; }
+  summary { font-size:17px; color:var(--fg); }
+</style>
+</head>
+<body>
+<main>
+  <h1>🎤 こえアンプ</h1>
+  <button id="power" type="button">スタート</button>
+  <div id="status">Bluetoothスピーカーを接続してからスタートしてください</div>
+
+  <section class="card">
+    <div class="row"><span>音量</span><span class="val" id="gainVal"></span></div>
+    <input id="gain" type="range" min="0" max="8" step="0.1" value="3">
+    <div class="row" style="margin-top:12px"><span>入力レベル</span></div>
+    <div class="meter"><div id="meter"></div></div>
+  </section>
+
+  <section class="card">
+    <label class="toggle">ハウリング対策（低音カット＋リミッター）<input id="filter" type="checkbox" checked></label>
+    <label class="toggle">ノイズ抑制<input id="noise" type="checkbox" checked></label>
+  </section>
+
+  <details class="card">
+    <summary>使い方とコツ</summary>
+    <ol>
+      <li>iPadの設定 → Bluetooth でスピーカーを接続します。</li>
+      <li>「スタート」を押し、マイクの使用を「許可」します。</li>
+      <li>音量スライダーで大きさを調整します。</li>
+    </ol>
+    <ul>
+      <li>「キーン」と鳴る（ハウリング）ときは、音量を下げるか、スピーカーをiPadから離して、iPadのマイクに向けないでください。</li>
+      <li>Bluetoothの仕組み上、声が少し（0.1〜0.3秒）遅れて聞こえます。</li>
+      <li>使用中は画面を開いたままにしてください（自動で消灯しないようにしています）。</li>
+      <li>オン／オフ切り替えはスピーカーの抜き差しで音の出先が変わることがあります。接続後にスタートするのが確実です。</li>
+    </ul>
+  </details>
+</main>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const power = $('power'), gainEl = $('gain'), gainVal = $('gainVal'),
+        meterEl = $('meter'), statusEl = $('status'), filterEl = $('filter'), noiseEl = $('noise');
+
+  let ctx, stream, src, hp, comp, gainNode, analyser, raf, wakeLock;
+  let running = false;
+
+  // 保存された設定を復元
+  try {
+    const s = JSON.parse(localStorage.getItem('voiceamp') || '{}');
+    if (s.gain != null) gainEl.value = s.gain;
+    if (s.filter != null) filterEl.checked = s.filter;
+    if (s.noise != null) noiseEl.checked = s.noise;
+  } catch {}
+  const save = () => {
+    try { localStorage.setItem('voiceamp', JSON.stringify({ gain: gainEl.value, filter: filterEl.checked, noise: noiseEl.checked })); } catch {}
+  };
+
+  const showGain = () => { gainVal.textContent = '×' + Number(gainEl.value).toFixed(1); };
+  showGain();
+
+  const setStatus = (msg, warn = false) => { statusEl.textContent = msg; statusEl.classList.toggle('warn', warn); };
+
+  // マイク → [低音カット → コンプレッサー] → 音量 → スピーカー
+  function connectGraph() {
+    src.disconnect(); hp.disconnect(); comp.disconnect();
+    if (filterEl.checked) { src.connect(hp); hp.connect(comp); comp.connect(gainNode); }
+    else { src.connect(gainNode); }
+    src.connect(analyser);
+  }
+
+  async function start() {
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: false, autoGainControl: false, noiseSuppression: noiseEl.checked, channelCount: 1 }
+      });
+    } catch (e) {
+      setStatus('マイクが使えません。設定 → Safari → マイク を「許可」にしてください。', true);
+      return;
+    }
+    ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+    await ctx.resume();
+
+    src = ctx.createMediaStreamSource(stream);
+    hp = ctx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 180; hp.Q.value = 0.7;
+    comp = ctx.createDynamicsCompressor();
+    comp.threshold.value = -24; comp.knee.value = 6; comp.ratio.value = 12; comp.attack.value = 0.003; comp.release.value = 0.15;
+    gainNode = ctx.createGain(); gainNode.gain.value = Number(gainEl.value);
+    analyser = ctx.createAnalyser(); analyser.fftSize = 512;
+
+    connectGraph();
+    gainNode.connect(ctx.destination);
+
+    try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
+
+    running = true;
+    power.textContent = 'ストップ'; power.classList.add('on');
+    setStatus('拡声中… 話しかけてください');
+    drawMeter();
+  }
+
+  async function stop() {
+    running = false;
+    cancelAnimationFrame(raf);
+    stream?.getTracks().forEach(t => t.stop());
+    try { await ctx?.close(); } catch {}
+    try { await wakeLock?.release(); } catch {}
+    ctx = stream = wakeLock = null;
+    meterEl.style.width = '0';
+    power.textContent = 'スタート'; power.classList.remove('on');
+    setStatus('停止しました');
+  }
+
+  function drawMeter() {
+    const buf = new Float32Array(analyser.fftSize);
+    const loop = () => {
+      analyser.getFloatTimeDomainData(buf);
+      let sum = 0; for (const v of buf) sum += v * v;
+      const db = 20 * Math.log10(Math.sqrt(sum / buf.length) + 1e-8);
+      meterEl.style.width = Math.max(0, Math.min(100, (db + 60) / 60 * 100)) + '%';
+      raf = requestAnimationFrame(loop);
+    };
+    loop();
+  }
+
+  power.addEventListener('click', () => (running ? stop() : start()));
+
+  gainEl.addEventListener('input', () => {
+    showGain(); save();
+    if (gainNode) gainNode.gain.setTargetAtTime(Number(gainEl.value), ctx.currentTime, 0.02);
+  });
+  filterEl.addEventListener('change', () => { save(); if (running) connectGraph(); });
+  noiseEl.addEventListener('change', async () => {
+    save();
+    if (running) { await stop(); await start(); }
+  });
+
+  // 画面復帰時：消灯防止を取り直し、止まった音声を再開
+  document.addEventListener('visibilitychange', async () => {
+    if (document.visibilityState !== 'visible' || !running) return;
+    try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
+    if (ctx?.state !== 'running') { try { await ctx.resume(); } catch {} }
+  });
+
+  if (!navigator.mediaDevices?.getUserMedia) {
+    setStatus('このページは https で開く必要があります（Safari推奨）', true);
+    power.disabled = true;
+  }
+})();
+</script>
+</body>
+</html>
